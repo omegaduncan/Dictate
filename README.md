@@ -1,5 +1,7 @@
 # Dictate Keyboard (Whisper AI transcription)
 
+[切换到中文版](./README_zh.md)
+
 <a href='https://play.google.com/store/apps/details?id=net.devemperor.dictate'><img alt='Get it on Google Play' width="258px" height="100px" src='https://github.com/DevEmperor/Dictate/blob/d99981575350cfde1fa91d4c449d97483eda14d0/img/google-play-badge.png?raw=true'/></a>
 
 #### Dictate is an easy-to-use keyboard for transcribing and dictating. The app uses [OpenAI Whisper](https://openai.com/index/whisper/) in the background, which supports extremely accurate results for [many different languages](https://platform.openai.com/docs/guides/speech-to-text/supported-languages) with punctuation and custom AI rewording using GPT-4 Omni. Since a picture is worth a thousand words, here is a showcase video and some screenshots:
@@ -10,11 +12,24 @@
 
 
 
+## Recent Changes
+
+1. Improved network connectivity handling:
+   - Added network availability check before API requests
+   - Implemented retry mechanism for failed requests (max 3 attempts)
+2. Enhanced error handling and user feedback:
+   - Added new error messages for network issues and max retries reached
+   - Improved error logging for better debugging
+3. Upgraded dependencies:
+   - Updated GitHub Actions workflow
+   - Added OkHttp library for network requests
+4. Refactored network request logic:
+   - Replaced Retrofit with OkHttp for more direct control over requests
+   - Improved request and response handling
+
 ## Installation
 
 **The app is available on [Google Play](https://play.google.com/store/apps/details?id=net.devemperor.dictate)** (for a small fee to support me and the future development), so you get easy installation and free lifetime updates. Just click on the badge above or [on this link](https://play.google.com/store/apps/details?id=net.devemperor.dictate).
-
-
 
 ## License
 

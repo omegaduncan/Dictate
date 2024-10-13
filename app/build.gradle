@@ -54,4 +54,7 @@ dependencies {
     // Import the Firebase BoM
     implementation platform(libs.firebase.bom)
     implementation libs.firebase.crashlytics
+
+    implementation 'com.squareup.okhttp3:okhttp:4.10.0'  // 使用最新版本
+    implementation 'org.json:json:20210307'
 }

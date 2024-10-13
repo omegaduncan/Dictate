@@ -14,12 +14,15 @@ import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaRecorder;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.ContextThemeWrapper;
 import android.view.LayoutInflater;
@@ -66,6 +69,10 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.net.ConnectException;
+import java.net.MalformedURLException;
+import java.net.SocketTimeoutException;
+import java.net.URL;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
@@ -76,10 +83,16 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import retrofit2.Retrofit;
 import retrofit2.adapter.rxjava2.RxJava2CallAdapterFactory;
 import retrofit2.converter.jackson.JacksonConverterFactory;
+
+import okhttp3.*;
+import org.json.JSONObject;
+import java.io.IOException;
+import org.json.JSONArray;
 
 // MAIN CLASS
 public class DictateInputMethodService extends InputMethodService {
@@ -142,6 +155,18 @@ public class DictateInputMethodService extends InputMethodService {
     PromptsKeyboardAdapter promptsAdapter;
 
     UsageDatabaseHelper usageDb;
+
+    private static final int MAX_RETRIES = 3;
+    private int retryCount = 0;
+
+    private OkHttpClient client;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        // 初始化 OkHttpClient
+        client = new OkHttpClient();
+    }
 
     // start method that is called when user opens the keyboard
     @SuppressLint("ClickableViewAccessibility")
@@ -255,7 +280,7 @@ public class DictateInputMethodService extends InputMethodService {
             vibrate();
             // if user clicked on resendButton without error before, audioFile is default audio
             if (audioFile == null) audioFile = new File(getCacheDir(), sp.getString("net.devemperor.dictate.last_file_name", "audio.mp3"));
-            startWhisperApiRequest();
+            startWhisperApiRequestWithRetry();
         });
 
         backspaceButton.setOnClickListener(v -> {
@@ -601,7 +626,7 @@ public class DictateInputMethodService extends InputMethodService {
             sp.edit().putString("net.devemperor.dictate.last_file_name", audioFile.getName()).apply();
 
             sp.edit().remove("net.devemperor.dictate.transcription_audio_file").apply();
-            startWhisperApiRequest();
+            startWhisperApiRequestWithRetry();
 
         } else if (sp.getBoolean("net.devemperor.dictate.instant_recording", false)) {
             recordButton.performClick();
@@ -689,11 +714,31 @@ public class DictateInputMethodService extends InputMethodService {
                 recordTimeHandler.removeCallbacks(recordTimeRunnable);
             }
 
+            startWhisperApiRequestWithRetry();
+        }
+    }
+
+    private boolean isNetworkAvailable() {
+        ConnectivityManager connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        NetworkInfo activeNetworkInfo = connectivityManager.getActiveNetworkInfo();
+        return activeNetworkInfo != null && activeNetworkInfo.isConnected();
+    }
+
+    private void startWhisperApiRequestWithRetry() {
+        if (retryCount < MAX_RETRIES) {
             startWhisperApiRequest();
+        } else {
+            showInfo("max_retries_reached");
+            retryCount = 0;
         }
     }
 
     private void startWhisperApiRequest() {
+        if (!isNetworkAvailable()) {
+            showInfo("no_internet");
+            return;
+        }
+
         recordButton.setText(R.string.dictate_sending);
         recordButton.setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_baseline_send_20, 0, 0, 0);
         recordButton.setEnabled(false);
@@ -719,93 +764,105 @@ public class DictateInputMethodService extends InputMethodService {
                 stylePrompt = "";
         }
 
-        String customApiHost = sp.getString("net.devemperor.dictate.custom_api_host", getString(R.string.dictate_custom_host_hint));
         String apiKey = sp.getString("net.devemperor.dictate.api_key", "NO_API_KEY");
         String language = currentInputLanguageValue;
-        Retrofit retrofit = new Retrofit.Builder()
-                .baseUrl(sp.getBoolean("net.devemperor.dictate.custom_api_host_enabled", false) ? customApiHost : "https://api.openai.com/")
-                .client(defaultClient(apiKey.replaceAll("[^ -~]", ""), Duration.ofSeconds(120)).newBuilder().build())
-                .addConverterFactory(JacksonConverterFactory.create(defaultObjectMapper()))
-                .addCallAdapterFactory(RxJava2CallAdapterFactory.create())
+        String apiUrl = getApiBaseUrl() + "v1/audio/transcriptions";
+
+        OkHttpClient client = new OkHttpClient();
+
+        RequestBody requestBody = new MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", audioFile.getName(),
+                        RequestBody.create(MediaType.parse("audio/mpeg"), audioFile))
+                .addFormDataPart("model", "whisper-1")
+                .addFormDataPart("response_format", "verbose_json")
+                .addFormDataPart("language", !language.equals("detect") ? language : "")
                 .build();
-        OpenAiService service = new OpenAiService(retrofit.create(OpenAiApi.class));
 
-        speechApiThread = Executors.newSingleThreadExecutor();
-        speechApiThread.execute(() -> {
-            try {
-                CreateTranscriptionRequest request = CreateTranscriptionRequest.builder()
-                        .model("whisper-1")
-                        .responseFormat("verbose_json")
-                        .language(!language.equals("detect") ? language : null)
-                        .prompt(!stylePrompt.isEmpty() ? stylePrompt : null)
-                        .build();
-                TranscriptionResult result = service.createTranscription(request, audioFile);
-                String resultText = result.getText();
+        String requestBodyString = requestBody.toString(); // 確保 requestBody 已被初始化並轉換為字串
 
-                usageDb.edit("whisper-1", result.getDuration().longValue(), 0, 0);
+        Request request = new Request.Builder()
+                .url(apiUrl)
+                .addHeader("Authorization", "Bearer " + apiKey)
+                .post(requestBody)
+                .build();
 
-                if (!instantPrompt) {
-                    InputConnection inputConnection = getCurrentInputConnection();
-                    if (inputConnection != null) {
-                        if (sp.getBoolean("net.devemperor.dictate.instant_output", false)) {
-                            inputConnection.commitText(resultText, 1);
-                        } else {
-                            int speed = sp.getInt("net.devemperor.dictate.output_speed", 5);
-                            for (int i = 0; i < resultText.length(); i++) {
-                                char character = resultText.charAt(i);
-                                mainHandler.postDelayed(() -> inputConnection.commitText(String.valueOf(character), 1), (long) (i * (20L / (speed / 5f))));
-                            }
-                        }
-                    }
-                } else {
-                    // continue with ChatGPT API request
-                    instantPrompt = false;
-                    startGPTApiRequest(new PromptModel(-1, Integer.MIN_VALUE, "", resultText, false));
-                }
-
-                if (new File(getCacheDir(), sp.getString("net.devemperor.dictate.last_file_name", "audio.mp3")).exists()
-                        && sp.getBoolean("net.devemperor.dictate.resend_button", false)) {
-                    mainHandler.post(() -> resendButton.setVisibility(View.VISIBLE));
-                }
-
-            } catch (RuntimeException e) {
-                // check if RuntimeException was caused by InterruptedIOException
-                if (!(e.getCause() instanceof InterruptedIOException)) {
-                    sendLogToCrashlytics(e);
-
-                    if (vibrationEnabled) vibrator.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE));
-
-                    mainHandler.post(() -> {
-                        resendButton.setVisibility(View.VISIBLE);
-                        if (Objects.requireNonNull(e.getMessage()).contains("SocketTimeoutException")) {
-                            showInfo("timeout");
-                        } else if (e.getMessage().contains("API key")) {
-                            showInfo("invalid_api_key");
-                        } else if (e.getMessage().contains("quota")) {
-                            showInfo("quota_exceeded");
-                        } else if (e.getMessage().contains("content size limit")) {
-                            showInfo("content_size_limit");
-                        } else if (e.getMessage().contains("format")) {
-                            showInfo("format_not_supported");
-                        } else if (sp.getBoolean("net.devemperor.dictate.custom_api_host_enabled", false)) {
-                            if (e.getMessage().contains("ConnectException")) {
-                                showInfo("internet_error");
-                            } else {
-                                showInfo("unknown_host");
-                            }
-                        } else {
-                            showInfo("internet_error");
-                        }
-                    });
-                }
+        client.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                handleApiError(e, requestBodyString, "");
             }
 
-            mainHandler.post(() -> {
-                recordButton.setText(R.string.dictate_record);
-                recordButton.setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_baseline_mic_20, 0, R.drawable.ic_baseline_folder_open_20, 0);
-                recordButton.setEnabled(true);
-            });
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                if (!response.isSuccessful()) {
+                    handleApiError(new IOException("Unexpected code " + response), requestBodyString, response.body().string());
+                    return;
+                }
+
+                String responseBody = response.body().string();
+                try {
+                    JSONObject jsonResponse = new JSONObject(responseBody);
+                    String resultText = jsonResponse.getString("text");
+                    long duration = jsonResponse.has("duration") ? jsonResponse.getLong("duration") : 0L;
+
+                    usageDb.edit("whisper-1", duration, 0, 0);
+
+                    handleTranscriptionResult(resultText);
+                } catch (Exception e) {
+                    handleApiError(e, requestBodyString, responseBody);
+                }
+            }
         });
+    }
+
+    private void handleTranscriptionResult(String resultText) {
+        mainHandler.post(() -> {
+            if (!instantPrompt) {
+                InputConnection inputConnection = getCurrentInputConnection();
+                if (inputConnection != null) {
+                    if (sp.getBoolean("net.devemperor.dictate.instant_output", false)) {
+                        inputConnection.commitText(resultText, 1);
+                    } else {
+                        int speed = sp.getInt("net.devemperor.dictate.output_speed", 5);
+                        for (int i = 0; i < resultText.length(); i++) {
+                            char character = resultText.charAt(i);
+                            mainHandler.postDelayed(() -> inputConnection.commitText(String.valueOf(character), 1), (long) (i * (20L / (speed / 5f))));
+                        }
+                    }
+                }
+            } else {
+                // 繼續進行 ChatGPT API 請求
+                instantPrompt = false;
+                startGPTApiRequest(new PromptModel(-1, Integer.MIN_VALUE, "", resultText, false));
+            }
+
+            if (new File(getCacheDir(), sp.getString("net.devemperor.dictate.last_file_name", "audio.mp3")).exists()
+                    && sp.getBoolean("net.devemperor.dictate.resend_button", false)) {
+                resendButton.setVisibility(View.VISIBLE);
+            }
+
+            recordButton.setText(R.string.dictate_record);
+            recordButton.setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_baseline_mic_20, 0, R.drawable.ic_baseline_folder_open_20, 0);
+            recordButton.setEnabled(true);
+        });
+    }
+
+    private OkHttpClient createOkHttpClient() {
+        String apiKey = sp.getString("net.devemperor.dictate.api_key", "NO_API_KEY").replaceAll("[^ -~]", "");
+        return new OkHttpClient.Builder()
+                .addInterceptor(chain -> {
+                    Request original = chain.request();
+                    Request request = original.newBuilder()
+                            .header("Authorization", "Bearer " + apiKey)
+                            .method(original.method(), original.body())
+                            .build();
+                    return chain.proceed(request);
+                })
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
+                .build();
     }
 
     private void startGPTApiRequest(PromptModel model) {
@@ -817,8 +874,8 @@ public class DictateInputMethodService extends InputMethodService {
             infoCl.setVisibility(View.GONE);
         });
 
-        String apiKey = sp.getString("net.devemperor.dictate.api_key", "NO_API_KEY");
-        OpenAiService service = new OpenAiService(apiKey.replaceAll("[^ -~]", ""), Duration.ofSeconds(120));
+        OkHttpClient client = createOkHttpClient();
+        String baseUrl = getApiBaseUrl();
 
         rewordingApiThread = Executors.newSingleThreadExecutor();
         rewordingApiThread.execute(() -> {
@@ -834,14 +891,36 @@ public class DictateInputMethodService extends InputMethodService {
                     }
 
                     String gptModel = sp.getString("net.devemperor.dictate.rewording_model", "gpt-4o-mini");
-                    ChatCompletionRequest request = ChatCompletionRequest.builder()
-                            .model(gptModel)
-                            .messages(Collections.singletonList(new ChatMessage(ChatMessageRole.USER.value(), prompt)))
-                            .build();
-                    ChatCompletionResult rewordedResult = service.createChatCompletion(request);
-                    rewordedText = rewordedResult.getChoices().get(0).getMessage().getContent();
+                    
+                    JSONObject jsonBody = new JSONObject();
+                    jsonBody.put("model", gptModel);
+                    jsonBody.put("messages", new JSONArray().put(new JSONObject()
+                            .put("role", "user")
+                            .put("content", prompt)));
 
-                    usageDb.edit(gptModel, 0, rewordedResult.getUsage().getPromptTokens(), rewordedResult.getUsage().getCompletionTokens());
+                    RequestBody body = RequestBody.create(
+                            MediaType.parse("application/json; charset=utf-8"),
+                            jsonBody.toString()
+                    );
+
+                    Request request = new Request.Builder()
+                            .url(baseUrl + "v1/chat/completions")
+                            .post(body)
+                            .build();
+
+                    try (Response response = client.newCall(request).execute()) {
+                        if (!response.isSuccessful()) throw new IOException("Unexpected code " + response);
+
+                        String responseBody = response.body().string();
+                        JSONObject jsonResponse = new JSONObject(responseBody);
+                        rewordedText = jsonResponse.getJSONArray("choices")
+                                .getJSONObject(0)
+                                .getJSONObject("message")
+                                .getString("content");
+
+                        JSONObject usage = jsonResponse.getJSONObject("usage");
+                        usageDb.edit(gptModel, 0, usage.getInt("prompt_tokens"), usage.getInt("completion_tokens"));
+                    }
                 }
 
                 InputConnection inputConnection = getCurrentInputConnection();
@@ -856,22 +935,8 @@ public class DictateInputMethodService extends InputMethodService {
                         }
                     }
                 }
-            } catch (RuntimeException e) {
-                sendLogToCrashlytics(e);
-
-                if (vibrationEnabled) vibrator.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE));
-
-                mainHandler.post(() -> {
-                    if (Objects.requireNonNull(e.getMessage()).contains("SocketTimeoutException")) {
-                        showInfo("timeout");
-                    } else if (e.getMessage().contains("API key")) {
-                        showInfo("invalid_api_key");
-                    } else if (e.getMessage().contains("quota")) {
-                        showInfo("quota_exceeded");
-                    } else {
-                        showInfo("internet_error");
-                    }
-                });
+            } catch (Exception e) {
+                handleApiError(e, "", "");
             }
 
             mainHandler.post(() -> {
@@ -1017,6 +1082,16 @@ public class DictateInputMethodService extends InputMethodService {
                 infoCl.removeCallbacks(disableInfoRunnable);
                 infoCl.postDelayed(disableInfoRunnable, 3000);
                 break;
+            case "no_internet":
+                infoTv.setText(R.string.dictate_no_internet_msg);
+                infoYesButton.setVisibility(View.GONE);
+                infoNoButton.setOnClickListener(v -> infoCl.setVisibility(View.GONE));
+                break;
+            case "max_retries_reached":
+                infoTv.setText(R.string.dictate_max_retries_reached_msg);
+                infoYesButton.setVisibility(View.GONE);
+                infoNoButton.setOnClickListener(v -> infoCl.setVisibility(View.GONE));
+                break;
         }
     }
 
@@ -1049,6 +1124,130 @@ public class DictateInputMethodService extends InputMethodService {
                 charView.setBackground(AppCompatResources.getDrawable(this, R.drawable.border_textview));
             }
         }
+    }
+
+    private void handleApiError(Exception e, String requestDetails, String responseDetails) {
+        if (vibrationEnabled) vibrator.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE));
+
+        String errorMessage = "錯誤日誌:\n";
+        errorMessage += "錯誤類型: " + e.getClass().getSimpleName() + "\n";
+        errorMessage += "錯誤信息: " + e.getMessage() + "\n";
+        errorMessage += "請求內容:\n" + requestDetails + "\n";
+        errorMessage += "回應內容:\n" + responseDetails + "\n";
+        errorMessage += "堆棧跟踪:\n";
+        StringWriter sw = new StringWriter();
+        e.printStackTrace(new PrintWriter(sw));
+        errorMessage += sw.toString();
+
+        // 將錯誤信息輸出到當前輸入框
+        InputConnection inputConnection = getCurrentInputConnection();
+        if (inputConnection != null) {
+            inputConnection.commitText(errorMessage, 1);
+        }
+
+        mainHandler.post(() -> {
+            resendButton.setVisibility(View.VISIBLE);
+            if (e instanceof SocketTimeoutException) {
+                showInfo("timeout");
+            } else if (e.getMessage().contains("API key")) {
+                showInfo("invalid_api_key");
+            } else if (e.getMessage().contains("quota")) {
+                showInfo("quota_exceeded");
+            } else if (e.getMessage().contains("content size limit")) {
+                showInfo("content_size_limit");
+            } else if (e.getMessage().contains("format")) {
+                showInfo("format_not_supported");
+            } else if (sp.getBoolean("net.devemperor.dictate.custom_api_host_enabled", false)) {
+                if (e instanceof ConnectException) {
+                    showInfo("internet_error");
+                } else {
+                    Log.e("DictateInputMethodService", "Custom API host error: " + e.getMessage());
+                    showInfo("invalid_custom_api_host");
+                }
+            } else {
+                showInfo("internet_error");
+            }
+        });
+
+        if (retryCount < MAX_RETRIES) {
+            retryCount++;
+            mainHandler.postDelayed(this::startWhisperApiRequestWithRetry, 1000 * retryCount);
+        } else {
+            showInfo("max_retries_reached");
+            retryCount = 0;
+        }
+    }
+
+    private String getApiBaseUrl() {
+        boolean useCustomHost = sp.getBoolean("net.devemperor.dictate.custom_api_host_enabled", false);
+        if (useCustomHost) {
+            String customHost = sp.getString("net.devemperor.dictate.custom_api_host", "");
+            Log.d("DictateInputMethodService", "Custom API host enabled. Raw value: " + customHost);
+            String validatedHost = validateAndFormatCustomApiHost(customHost);
+            if (validatedHost != null) {
+                Log.d("DictateInputMethodService", "Using validated custom API host: " + validatedHost);
+                return validatedHost;
+            } else {
+                Log.e("DictateInputMethodService", "Failed to validate custom API host. Falling back to default.");
+            }
+        }
+        Log.d("DictateInputMethodService", "Using default API host: https://api.openai.com/");
+        return "https://api.openai.com/";
+    }
+
+    private void logApiRequest(String apiName, String requestDetails) {
+        Log.d("DictateAPI", "Sending " + apiName + " request: " + requestDetails);
+    }
+
+    private void logApiResponse(String apiName, String responseDetails) {
+        Log.d("DictateAPI", "Received " + apiName + " response: " + responseDetails);
+    }
+
+    private void logApiError(String apiName, Exception e) {
+        Log.e("DictateAPI", "Error in " + apiName + " request: " + e.getMessage(), e);
+    }
+
+    private String validateAndFormatCustomApiHost(String customHost) {
+        if (TextUtils.isEmpty(customHost)) {
+            return null;
+        }
+        
+        if (!customHost.startsWith("http://") && !customHost.startsWith("https://")) {
+            customHost = "https://" + customHost;
+        }
+        
+        try {
+            URL url = new URL(customHost);
+            return url.toString().endsWith("/") ? url.toString() : url.toString() + "/";
+        } catch (MalformedURLException e) {
+            Log.e("DictateInputMethodService", "Invalid custom API host: " + customHost);
+            return null;
+        }
+    }
+
+    private void sendRequestWithRetry(Request request, int maxRetries) {
+        for (int i = 0; i < maxRetries; i++) {
+            try {
+                Response response = client.newCall(request).execute();
+                // 處理響應
+                return;
+            } catch (SocketTimeoutException e) {
+                if (i == maxRetries - 1) {
+                    // 最後一次重試失敗，處理錯誤
+                    handleApiError(e, "", "");
+                }
+            } catch (IOException e) {
+                handleApiError(e, "", "");
+                return;
+            }
+        }
+    }
+
+    private void logRequestDetails(Request request) {
+        Log.d("API_REQUEST", "URL: " + request.url());
+        Log.d("API_REQUEST", "Method: " + request.method());
+        Log.d("API_REQUEST", "Headers: " + request.headers());
+        // 如果需要，也可以記錄請求體
     }
 
 }

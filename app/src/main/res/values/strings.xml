@@ -192,4 +192,6 @@
     <string name="dictate_input_languages_empty">You have to select at least one input language.</string>
     <string name="dictate_language_switched_msg">Input language: %1$s</string>
     <string name="dictate_changelog_15">v2.4.3\n\nThis is just a small update. In the settings, you can now select multiple input languages. If you then press and hold the switch-button while using Dictate, you can switch to one of these input languages faster. 💪\n\n\n</string>
+    <string name="dictate_no_internet_msg">無法連接到網路。請檢查你的網路連接。</string>
+    <string name="dictate_max_retries_reached_msg">已達到最大重試次數。請稍後再試。</string>
 </resources>
